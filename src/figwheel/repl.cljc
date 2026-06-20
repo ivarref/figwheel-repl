@@ -320,7 +320,7 @@
                        (.on "error" #(js/console.error %))
                        (doto
                         (.write post-data)
-                         (.end)))))
+                        (.end)))))
                (fn [url response]
                  (js/goog.net.XhrIo.send
                   url
@@ -413,8 +413,10 @@
                  (session-name) (.add "fwsname" (session-name)))
                uri))
 
-           (defn exponential-backoff [attempt]
-             (* 1000 (min (js/Math.pow 2 attempt) 20)))
+           (defn exponential-backoff
+             ([attempt] (exponential-backoff attempt 1000))
+             ([attempt base-ms]
+              (min (* base-ms (js/Math.pow 2 attempt)) 20000)))
 
            (defn hook-repl-printing-output! [respond-msg]
              (defmethod out-print :repl [_ args]
@@ -446,149 +448,351 @@
                     (gobj/add "data" {:url url}))))))
 
 ;; -----------------------------------------------------------
-;; EventSource (SSE) connection
+;; EventSource abstraction + polyfills
 ;; -----------------------------------------------------------
 
-           (defn eventsource-connect [connect-url']
+           (defn parse-sse-frame [frame-text]
+             (let [lines (-> frame-text
+                             (string/replace #"\r\n?" "\n")
+                             (string/split #"\n"))
+                   {:keys [event retry data has-data?]}
+                   (reduce (fn [acc line]
+                             (cond
+                               (string/starts-with? line "event: ")
+                               (assoc acc :event (subs line 7))
+
+                               (string/starts-with? line "event:")
+                               (assoc acc :event (subs line 6))
+
+                               (string/starts-with? line "retry: ")
+                               (if-let [retry-val (js/parseInt (subs line 7) 10)]
+                                 (if (js/isNaN retry-val) acc (assoc acc :retry retry-val))
+                                 acc)
+
+                               (string/starts-with? line "retry:")
+                               (if-let [retry-val (js/parseInt (subs line 6) 10)]
+                                 (if (js/isNaN retry-val) acc (assoc acc :retry retry-val))
+                                 acc)
+
+                               (string/starts-with? line "data: ")
+                               (-> acc
+                                   (update :data conj (subs line 6))
+                                   (assoc :has-data? true))
+
+                               (string/starts-with? line "data:")
+                               (-> acc
+                                   (update :data conj (subs line 5))
+                                   (assoc :has-data? true))
+
+                               :else
+                               acc))
+                           {:data [] :has-data? false}
+                           lines)]
+               (cond-> {}
+                 event (assoc :event event)
+                 (some? retry) (assoc :retry retry)
+                 has-data? (assoc :data (string/join "\n" data)))))
+
+           (defn split-sse-frames [buffer]
+             (let [last-boundary (->> ["\r\n\r\n" "\n\n" "\r\r"]
+                                      (keep (fn [separator]
+                                              (let [idx (.lastIndexOf buffer separator)]
+                                                (when (<= 0 idx)
+                                                  (+ idx (count separator))))))
+                                      sort
+                                      last)]
+               (if-not last-boundary
+                 {:frames [] :buffer buffer}
+                 {:frames (remove string/blank?
+                                  (string/split (subs buffer 0 last-boundary)
+                                                #"\r\n\r\n|\n\n|\r\r"))
+                  :buffer (subs buffer last-boundary)})))
+
+           (defn dispatch-event! [source listeners type event]
+             (doseq [listener (get @listeners type)]
+               (try
+                 (listener event)
+                 (catch :default e
+                   (log/error logger e))))
+             (when-let [handler (gobj/get source (str "on" type))]
+               (try
+                 (handler event)
+                 (catch :default e
+                   (log/error logger e)))))
+
+           (defn xhr-event-source [url]
+             (let [source (js-obj)
+                   listeners (atom {})
+                   reconnect-timer (atom nil)
+                   closed? (atom false)
+                   retry-ms (atom 1000)
+                   attempt (atom 0)
+                   xhr* (atom nil)]
+               (letfn [(clear-reconnect! []
+                         (when-let [timer @reconnect-timer]
+                           (js/clearTimeout timer)
+                           (reset! reconnect-timer nil)))
+                       (close-xhr! []
+                         (when-let [xhr @xhr*]
+                           (reset! xhr* nil)
+                           (.abort xhr)))
+                       (schedule-reconnect! []
+                         (when-not @closed?
+                           (clear-reconnect!)
+                           (let [wait-time (exponential-backoff @attempt @retry-ms)]
+                             (swap! attempt inc)
+                             (log/info logger (str "Connection lost. Reconnecting in " (/ wait-time 1000) " seconds"))
+                             (reset! reconnect-timer
+                                     (js/setTimeout
+                                      (fn []
+                                        (reset! reconnect-timer nil)
+                                        (open!))
+                                      wait-time)))))
+                       (process-frame! [frame]
+                         (let [{:keys [event retry data] :as frame-data} (parse-sse-frame frame)]
+                           (when retry
+                             (reset! retry-ms retry))
+                           (when (contains? frame-data :data)
+                             (dispatch-event!
+                              source
+                              listeners
+                              (or event "message")
+                              #js {:type (or event "message")
+                                   :data data
+                                   :url url}))))
+                       (open! []
+                         (when-not @closed?
+                           (clear-reconnect!)
+                           (close-xhr!)
+                           (gobj/set source "readyState" 0)
+                           (let [xhr (js/XMLHttpRequest.)
+                                 last-index (atom 0)
+                                 buffer* (atom "")
+                                 opened? (atom false)
+                                 open-connection!
+                                 (fn []
+                                   (when-not @opened?
+                                     (reset! opened? true)
+                                     (reset! attempt 0)
+                                     (gobj/set source "readyState" 1)
+                                     (dispatch-event! source listeners "open" #js {:type "open"})))]
+                             (reset! xhr* xhr)
+                             (.open xhr "GET" url true)
+                             (.setRequestHeader xhr "Accept" "text/event-stream")
+                             (.setRequestHeader xhr "Cache-Control" "no-cache")
+                             (set! (.-onreadystatechange xhr)
+                                   (fn []
+                                     (when-not @closed?
+                                       (let [ready-state (.-readyState xhr)
+                                             status (.-status xhr)]
+                                         (cond
+                                           (and (or (= ready-state js/XMLHttpRequest.LOADING)
+                                                    (= ready-state js/XMLHttpRequest.DONE))
+                                                (<= 200 status 399))
+                                           (let [response-text (or (.-responseText xhr) "")
+                                                 new-text (subs response-text @last-index)]
+                                             (reset! last-index (count response-text))
+                                             (open-connection!)
+                                             (when-not (string/blank? new-text)
+                                               (swap! buffer* str new-text)
+                                               (let [{:keys [frames buffer]} (split-sse-frames @buffer*)]
+                                                 (reset! buffer* buffer)
+                                                 (doseq [frame frames]
+                                                   (process-frame! frame))))
+                                             (when (= ready-state js/XMLHttpRequest.DONE)
+                                               (gobj/set source "readyState" 0)
+                                               (schedule-reconnect!)))
+
+                                           (and (= ready-state js/XMLHttpRequest.DONE)
+                                                (not= status 0))
+                                           (do
+                                             (gobj/set source "readyState" 0)
+                                             (dispatch-event!
+                                              source
+                                              listeners
+                                              "error"
+                                              #js {:type "error"
+                                                   :status status
+                                                   :message (str "HTTP " status)})
+                                             (schedule-reconnect!)))))))
+                             (set! (.-onerror xhr)
+                                   (fn [e]
+                                     (when-not @closed?
+                                       (gobj/set source "readyState" 0)
+                                       (dispatch-event! source listeners "error" #js {:type "error" :error e})
+                                       (schedule-reconnect!))))
+                             (.send xhr))))]
+                 (gobj/set source "readyState" 0)
+                 (gobj/set source "addEventListener"
+                           (fn [type listener]
+                             (swap! listeners update type (fnil conj []) listener)))
+                 (gobj/set source "removeEventListener"
+                           (fn [type listener]
+                             (swap! listeners update type
+                                    (fn [handlers]
+                                      (vec (remove #(identical? % listener) handlers))))))
+                 (gobj/set source "close"
+                           (fn []
+                             (reset! closed? true)
+                             (clear-reconnect!)
+                             (close-xhr!)
+                             (gobj/set source "readyState" 2)
+                             (dispatch-event! source listeners "close" #js {:type "close"})))
+                 (open!)
+                 source)))
+
+           (defn fetch-event-source [url]
+             (let [source (js-obj)
+                   listeners (atom {})
+                   reconnect-timer (atom nil)
+                   closed? (atom false)
+                   retry-ms (atom 1000)
+                   attempt (atom 0)
+                   controller* (atom nil)]
+               (letfn [(clear-reconnect! []
+                         (when-let [timer @reconnect-timer]
+                           (js/clearTimeout timer)
+                           (reset! reconnect-timer nil)))
+                       (close-request! []
+                         (when-let [controller @controller*]
+                           (reset! controller* nil)
+                           (.abort controller)))
+                       (schedule-reconnect! []
+                         (when-not @closed?
+                           (clear-reconnect!)
+                           (let [wait-time (exponential-backoff @attempt @retry-ms)]
+                             (swap! attempt inc)
+                             (log/info logger (str "Connection lost. Reconnecting in " (/ wait-time 1000) " seconds"))
+                             (reset! reconnect-timer
+                                     (js/setTimeout
+                                      (fn []
+                                        (reset! reconnect-timer nil)
+                                        (open!))
+                                      wait-time)))))
+                       (process-frame! [frame]
+                         (let [{:keys [event retry data] :as frame-data} (parse-sse-frame frame)]
+                           (when retry
+                             (reset! retry-ms retry))
+                           (when (contains? frame-data :data)
+                             (dispatch-event!
+                              source
+                              listeners
+                              (or event "message")
+                              #js {:type (or event "message")
+                                   :data data
+                                   :url url}))))
+                       (open! []
+                         (when-not @closed?
+                           (clear-reconnect!)
+                           (close-request!)
+                           (gobj/set source "readyState" 0)
+                           (let [controller (js/AbortController.)
+                                 decoder (js/TextDecoder.)
+                                 buffer* (atom "")]
+                             (reset! controller* controller)
+                             (-> (js/fetch url
+                                           #js {:headers #js {"Accept" "text/event-stream"
+                                                              "Cache-Control" "no-cache"}
+                                                :signal (.-signal controller)})
+                                 (.then (fn [response]
+                                          (if-not (and (.-ok response) (.-body response))
+                                            (throw (js/Error. (str "HTTP " (.-status response))))
+                                            (do
+                                              (reset! attempt 0)
+                                              (gobj/set source "readyState" 1)
+                                              (dispatch-event! source listeners "open" #js {:type "open"})
+                                              (let [reader (.getReader (.-body response))]
+                                                (letfn [(read-loop []
+                                                          (-> (.read reader)
+                                                              (.then (fn [result]
+                                                                       (if (.-done result)
+                                                                         (do
+                                                                           (gobj/set source "readyState" 0)
+                                                                           (schedule-reconnect!))
+                                                                         (do
+                                                                           (let [text (.decode decoder (.-value result) #js {:stream true})]
+                                                                             (swap! buffer* str text)
+                                                                             (let [{:keys [frames buffer]} (split-sse-frames @buffer*)]
+                                                                               (reset! buffer* buffer)
+                                                                               (doseq [frame frames]
+                                                                                 (process-frame! frame))))
+                                                                           (read-loop)))))
+                                                              (.catch (fn [e]
+                                                                        (when-not @closed?
+                                                                          (gobj/set source "readyState" 0)
+                                                                          (dispatch-event! source listeners "error" #js {:type "error" :error e})
+                                                                          (schedule-reconnect!))))))]
+                                                  (read-loop)))))))
+                                 (.catch (fn [e]
+                                           (when-not @closed?
+                                             (gobj/set source "readyState" 0)
+                                             (dispatch-event! source listeners "error" #js {:type "error" :error e})
+                                             (schedule-reconnect!))))))))]
+                 (gobj/set source "readyState" 0)
+                 (gobj/set source "addEventListener"
+                           (fn [type listener]
+                             (swap! listeners update type (fnil conj []) listener)))
+                 (gobj/set source "removeEventListener"
+                           (fn [type listener]
+                             (swap! listeners update type
+                                    (fn [handlers]
+                                      (vec (remove #(identical? % listener) handlers))))))
+                 (gobj/set source "close"
+                           (fn []
+                             (reset! closed? true)
+                             (clear-reconnect!)
+                             (close-request!)
+                             (gobj/set source "readyState" 2)
+                             (dispatch-event! source listeners "close" #js {:type "close"})))
+                 (open!)
+                 source)))
+
+           (defn create-event-source [url]
+             (cond
+               (exists? js/EventSource)
+               (js/EventSource. url)
+
+               (= host-env :react-native)
+               (xhr-event-source url)
+
+               (= host-env :node)
+               (fetch-event-source url)
+
+               (and (exists? js/globalThis.fetch)
+                    (exists? js/ReadableStream))
+               (fetch-event-source url)
+
+               (exists? js/XMLHttpRequest)
+               (xhr-event-source url)
+
+               :else
+               (throw (js/Error. "No EventSource transport available for this platform."))))
+
+           (defn connect-event-source! [connect-url']
              (let [url (make-url connect-url')
                    surl (str url)]
                (doto (.getQueryData url)
                  (.add "fwinit" "true"))
-               (let [es (js/EventSource. (str url))]
-                 (set! (.-onopen es)
-                       (fn [e]
-                         (connection-established! surl)
-                         (swap! state assoc :connection {:http-url surl})
-                         (hook-repl-printing-output! {:http-url surl})))
-                 (set! (.-onmessage es)
-                       (fn [e]
-                         (try
-                           (let [msg (js->clj (js/JSON.parse (.-data e)) :keywordize-keys true)]
-                             (debug (pr-str msg))
-                             (message (assoc msg :http-url surl)))
-                           (catch js/Error err
-                             (log/error logger err)))))
-                 (set! (.-onerror es)
-                       (fn [e]
-                         (when (= (.-readyState es) 2) ;; CLOSED
-                           (connection-closed! surl))
-                         (log/fine logger "EventSource error — reconnecting automatically"))))))
-
-;; -----------------------------------------------------------
-;; SSE frame parsing
-;; -----------------------------------------------------------
-
-           (defn parse-sse-data [frame-text]
-             (let [lines (string/split frame-text #"\n")
-                   data-lines (keep (fn [line]
-                                      (cond
-                                        (string/starts-with? line "data: ") (subs line 6)
-                                        (string/starts-with? line "data:") (subs line 5)
-                                        :else nil))
-                                    lines)]
-               (when (seq data-lines)
-                 (string/join "\n" data-lines))))
-
-           (defn reconnect-with-backoff [attempt connect-url' connect-fn]
-             (let [wait-time (exponential-backoff attempt)]
-               (log/info logger (str "Connection lost. Reconnecting in " (/ wait-time 1000) " seconds"))
-               (js/setTimeout #(connect-fn connect-url') wait-time)))
-
-;; -----------------------------------------------------------
-;; Fetch-based SSE connection (Web Workers, Node 18+)
-;; -----------------------------------------------------------
-
-           (defn fetch-sse-connect [connect-url']
-             (let [url (make-url connect-url')
-                   surl (str url)
-                   connected? (volatile! false)]
-               (doto (.getQueryData url)
-                 (.add "fwinit" "true"))
-               (-> (js/fetch (str url))
-                   (.then (fn [response]
-                            (if-not (.-ok response)
-                              (throw (js/Error. (str "HTTP " (.-status response))))
-                              (let [reader (.getReader (.-body response))
-                                    decoder (js/TextDecoder.)
-                                    buffer (volatile! "")]
-                                (letfn [(read-loop []
-                                          (-> (.read reader)
-                                              (.then (fn [result]
-                                                       (if (.-done result)
-                                                         (do (connection-closed! surl)
-                                                             (reconnect-with-backoff 0 connect-url' fetch-sse-connect))
-                                                         (let [text (.decode decoder (.-value result) #js {:stream true})
-                                                               parts (string/split (str @buffer text) #"\n\n" -1)]
-                                                           (vreset! buffer (last parts))
-                                                           (doseq [frame (butlast parts)]
-                                                             (when-let [data (parse-sse-data frame)]
-                                                               (try
-                                                                 (let [msg (js->clj (js/JSON.parse data) :keywordize-keys true)]
-                                                                   (when-not @connected?
-                                                                     (vreset! connected? true)
-                                                                     (connection-established! surl)
-                                                                     (swap! state assoc :connection {:http-url surl})
-                                                                     (hook-repl-printing-output! {:http-url surl}))
-                                                                   (debug (pr-str msg))
-                                                                   (message (assoc msg :http-url surl)))
-                                                                 (catch js/Error e
-                                                                   (log/error logger e)))))
-                                                           (read-loop)))))
-                                              (.catch (fn [e]
-                                                        (connection-closed! surl)
-                                                        (reconnect-with-backoff 0 connect-url' fetch-sse-connect)))))]
-                                  (read-loop))))))
-                   (.catch (fn [e]
-                             (when (instance? js/Error e) (log/error logger e))
-                             (reconnect-with-backoff 0 connect-url' fetch-sse-connect))))))
-
-;; -----------------------------------------------------------
-;; Node.js http/https module SSE connection (older Node without fetch)
-;; -----------------------------------------------------------
-
-           (defn node-sse-connect [connect-url']
-             (let [url (make-url connect-url')
-                   surl (str url)
-                   http-mod (if (gstring/startsWith (str url) "https")
-                              (js/require "https")
-                              (js/require "http"))
-                   buffer (volatile! "")
-                   connected? (volatile! false)]
-               (doto (.getQueryData url)
-                 (.add "fwinit" "true"))
-               (-> (.get http-mod (str url)
-                         (fn [response]
-                           (.on response "data"
-                                (fn [chunk]
-                                  (let [text (str chunk)
-                                        parts (string/split (str @buffer text) #"\n\n" -1)]
-                                    (vreset! buffer (last parts))
-                                    (doseq [frame (butlast parts)]
-                                      (when-let [data (parse-sse-data frame)]
-                                        (try
-                                          (let [msg (js->clj (js/JSON.parse data) :keywordize-keys true)]
-                                            (when-not @connected?
-                                              (vreset! connected? true)
-                                              (connection-established! surl)
-                                              (swap! state assoc :connection {:http-url surl})
-                                              (hook-repl-printing-output! {:http-url surl}))
-                                            (debug (pr-str msg))
-                                            (message (assoc msg :http-url surl)))
-                                          (catch js/Error e
-                                            (log/error logger e))))))))
-                           (.on response "end"
-                                (fn []
-                                  (connection-closed! surl)
-                                  (reconnect-with-backoff 0 connect-url' node-sse-connect)))
-                           (.on response "error"
-                                (fn [e]
-                                  (log/error logger e)
-                                  (connection-closed! surl)
-                                  (reconnect-with-backoff 0 connect-url' node-sse-connect)))))
-                   (.on "error"
-                        (fn [e]
-                          (log/error logger e)
-                          (reconnect-with-backoff 0 connect-url' node-sse-connect))))))
+               (let [source (create-event-source (str url))]
+                 (.addEventListener source "open"
+                                    (fn [_]
+                                      (connection-established! surl)
+                                      (swap! state assoc :connection {:http-url surl
+                                                                      :event-source source})
+                                      (hook-repl-printing-output! {:http-url surl})))
+                 (.addEventListener source "message"
+                                    (fn [e]
+                                      (try
+                                        (let [msg (js->clj (js/JSON.parse (.-data e)) :keywordize-keys true)]
+                                          (debug (pr-str msg))
+                                          (message (assoc msg :http-url surl)))
+                                        (catch js/Error err
+                                          (log/error logger err)))))
+                 (.addEventListener source "error"
+                                    (fn [_]
+                                      (when (= 2 (gobj/get source "readyState"))
+                                        (connection-closed! surl))))
+                 source)))
 
            (defn init-log-level! []
              (doseq [logger' (cond-> [logger]
@@ -605,17 +809,7 @@
                          (gstring/startsWith url "ws://")  (str "http://" (subs url 5))
                          (gstring/startsWith url "wss://") (str "https://" (subs url 6))
                          :else url)]
-               (cond
-                 ;; Browser, React Native — use native EventSource
-                 (exists? js/EventSource)
-                 (eventsource-connect url)
-                 ;; Web Workers, Node 18+ — use fetch + streaming reader
-                 (and (exists? js/globalThis.fetch)
-                      (exists? js/ReadableStream))
-                 (fetch-sse-connect url)
-                 ;; Older Node — use http/https module
-                 :else
-                 (node-sse-connect url))))
+               (connect-event-source! url)))
 
            (defn connect [& [connect-url']]
              (defonce connected
@@ -1118,7 +1312,6 @@
                                                     :host
                                                     :target
                                                     :output-to
-                                                    :http-async-endpoint
                                                     :ring-handler
                                                     :cljsjs-resources
                                                     :ring-server
@@ -1208,8 +1401,8 @@
                 (.stop proc)
                 (.destroy proc))
 
-              #_(.waitFor proc) ;; ?
-              )
+              #_(.waitFor proc)) ;; ?
+
             (when-let [listener @printing-listener]
               (remove-listener listener)))
 

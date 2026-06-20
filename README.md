@@ -89,21 +89,15 @@ support embedding the Figwheel REPL endpoint in your server.
 
 For larger projects it simplest to use figwheel connection as a
 side-channel, a separate REPL connection, that is distinct from your
-projects HTTP server. Figwheel's use of Web-sockets and CORS make this
+projects HTTP server. Figwheel's use of SSE and CORS make this
 side connection a simple matter. But inevitably there are situations
 where you want to embed the Figwheel endpoint in your server. So I'm
 giving this some serious attention.
 
-In addition to the Web-socket connection, I have implemented a simple
-HTTP polling connection which should allow anyone to embed
-figwheel-repl ring middleware into their stack. (Side note: I'm also
-looking at long polling).
-
-It is too bad that as a community we haven't landed on an agreed upon
-Ring web-socket interface, as this makes it much harder to allow simple
-embedding of a web-socket endpoint into the server of your choice. But
-I'm going to do my best to facilitate this by making it easier to
-create a web-socket endpoint from the provided api.
+The REPL endpoint now uses Server-Sent Events for server-to-client
+messages and HTTP POST for client-to-server responses. This keeps the
+Ring integration simple and allows the figwheel-repl middleware to be
+embedded into a regular HTTP stack.
 
 On a side note: I'm also considering making the default server a the
 `ring.jetty.adapter` as it is such a common dependency.
